@@ -96,7 +96,7 @@ fn urlencoding(value: &str) -> String {
 
 async fn product_detail(path: &str, env: &Env) -> Result<Response> {
     let slug = path.trim_start_matches("/api/products/");
-    let Some(mut product) = env.d1("DB")?.prepare("SELECT p.id,p.slug,p.title,p.category_id,p.source_url,p.summary,p.content,p.sort_order,c.name AS category_name FROM products p JOIN categories c ON c.id=p.category_id WHERE p.slug=?1 AND p.status='published'").bind(&[slug.into()])?.first::<serde_json::Value>(None).await? else {
+    let Some(mut product) = env.d1("DB")?.prepare("SELECT p.id,p.slug,p.title,p.category_id,p.source_url,p.summary,p.content,p.trendyol_url,p.idefix_url,p.hepsiburada_url,p.pazarama_url,p.n11_url,p.sort_order,c.name AS category_name FROM products p JOIN categories c ON c.id=p.category_id WHERE p.slug=?1 AND p.status='published'").bind(&[slug.into()])?.first::<serde_json::Value>(None).await? else {
         return Response::error(r#"{"error":{"code":"NOT_FOUND","message":"Ürün bulunamadı"}}"#, 404);
     };
     let id = product["id"].as_str().unwrap_or_default();
@@ -286,7 +286,7 @@ async fn admin_product(path: &str, req: &Request, env: &Env) -> Result<Response>
         return unauthorized();
     }
     let id = path.trim_start_matches("/api/admin/products/");
-    let Some(mut product) = env.d1("DB")?.prepare("SELECT id,slug,title,category_id,source_url,summary,content,status,sort_order,version FROM products WHERE id=?1")
+    let Some(mut product) = env.d1("DB")?.prepare("SELECT id,slug,title,category_id,source_url,summary,content,trendyol_url,idefix_url,hepsiburada_url,pazarama_url,n11_url,status,sort_order,version FROM products WHERE id=?1")
         .bind(&[id.into()])?.first::<serde_json::Value>(None).await? else {
         return Response::error(r#"{"error":{"code":"NOT_FOUND","message":"Ürün bulunamadı"}}"#, 404);
     };
@@ -543,6 +543,11 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
     let summary = product["summary"].as_str().unwrap_or("");
     let content = product["content"].as_str().unwrap_or("");
     let source = product["source_url"].as_str().unwrap_or("");
+    let trendyol = product["trendyol_url"].as_str().unwrap_or("");
+    let idefix = product["idefix_url"].as_str().unwrap_or("");
+    let hepsiburada = product["hepsiburada_url"].as_str().unwrap_or("");
+    let pazarama = product["pazarama_url"].as_str().unwrap_or("");
+    let n11 = product["n11_url"].as_str().unwrap_or("");
     let sort_order = product["sort_order"].as_i64().unwrap_or(0);
     let specs = body["specs"].as_array().cloned().unwrap_or_default();
     let media = body["media"].as_array().cloned().unwrap_or_default();
@@ -558,6 +563,9 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         || media.len() > 12
         || specs.len() > 50
         || (!source.is_empty() && !source.starts_with("https://"))
+        || [trendyol, idefix, hepsiburada, pazarama, n11]
+            .iter()
+            .any(|url| !url.is_empty() && (url.len() > 2048 || !url.starts_with("https://")))
     {
         return Response::error(
             r#"{"error":{"code":"INVALID_INPUT","message":"Ürün alanlarını kontrol edin"}}"#,
@@ -583,8 +591,8 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         .all()
         .await?
         .results::<serde_json::Value>()?;
-    let mut statements = vec![db.prepare("INSERT INTO products(id,category_id,slug,title,summary,content,status,source_url,sort_order,version) VALUES(?1,?2,?3,?4,?5,?6,?7,NULLIF(?8,''),?9,1) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,slug=excluded.slug,title=excluded.title,summary=excluded.summary,content=excluded.content,status=excluded.status,source_url=excluded.source_url,sort_order=excluded.sort_order,version=products.version+1 WHERE products.version=?10")
-        .bind(&[id.into(),category.into(),slug.into(),title.into(),summary.into(),content.into(),status.into(),source.into(),(sort_order as i32).into(),(expected.unwrap_or(0) as i32).into()])?,
+    let mut statements = vec![db.prepare("INSERT INTO products(id,category_id,slug,title,summary,content,status,source_url,sort_order,trendyol_url,idefix_url,hepsiburada_url,pazarama_url,n11_url,version) VALUES(?1,?2,?3,?4,?5,?6,?7,NULLIF(?8,''),?9,NULLIF(?10,''),NULLIF(?11,''),NULLIF(?12,''),NULLIF(?13,''),NULLIF(?14,''),1) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,slug=excluded.slug,title=excluded.title,summary=excluded.summary,content=excluded.content,status=excluded.status,source_url=excluded.source_url,sort_order=excluded.sort_order,trendyol_url=excluded.trendyol_url,idefix_url=excluded.idefix_url,hepsiburada_url=excluded.hepsiburada_url,pazarama_url=excluded.pazarama_url,n11_url=excluded.n11_url,version=products.version+1 WHERE products.version=?15")
+        .bind(&[id.into(),category.into(),slug.into(),title.into(),summary.into(),content.into(),status.into(),source.into(),(sort_order as i32).into(),trendyol.into(),idefix.into(),hepsiburada.into(),pazarama.into(),n11.into(),(expected.unwrap_or(0) as i32).into()])?,
         db.prepare("DELETE FROM product_specs WHERE product_id=?1").bind(&[id.into()])?,
         db.prepare("DELETE FROM product_media WHERE product_id=?1").bind(&[id.into()])?];
     for (index, spec) in specs.iter().enumerate() {
