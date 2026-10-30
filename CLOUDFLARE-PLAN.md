@@ -30,5 +30,5 @@
 - Yerel D1 migration uygulandı ve Rust Worker `127.0.0.1:8787` üzerinde çalışıyor. Sağlık, boş kategori/ürün listesi ve web origin CORS yanıtı kontrol edildi.
 - Admin oturumunu, katalog yazmalarını, kategori silme kısıtını, slider yönetimini ve taslak medya erişimini kullanıcıya ait `.dev.vars` değerleriyle yerel D1/R2 üzerinde doğrula.
 - Cloudflare Pages production origin'i CORS listesine eklendi; Worker kimlik bilgileri Secrets Store binding'lerinden okunuyor.
-- Cloudflare Workers Builds Build command `cargo install worker-build && worker-build --release` olmalı. İlk deploy D1/R2 kaynaklarını oluşturur; üretim D1 migration'ı sonrasında uzak veritabanına uygulanmalı.
+- Cloudflare Workers Builds ortamında Cargo hazır gelmediği için Build command Rust toolchain'i kurmalı: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-unknown-unknown && . "$HOME/.cargo/env" && cargo install worker-build && worker-build --release`. İlk deploy D1/R2 kaynaklarını oluşturur; üretim D1 migration'ı sonrasında uzak veritabanına uygulanmalı.
 - Admin oturumunu ve CRUD işlemlerini canlı D1/R2 üzerinde henüz doğrulama; secret değerleri kullanıcı tarafından girilecek.
