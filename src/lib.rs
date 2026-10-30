@@ -354,7 +354,7 @@ async fn save_category(mut req: Request, env: &Env) -> Result<Response> {
     }
     env.d1("DB")?
         .prepare("INSERT INTO categories(id,name,sort_order) VALUES(?1,?2,?3)")
-        .bind(&[id.into(), name.into(), order.into()])?
+        .bind(&[id.into(), name.into(), (order as i32).into()])?
         .run()
         .await?;
     Response::from_json(&serde_json::json!({"id":id,"name":name,"sort_order":order,"version":1}))
@@ -451,7 +451,7 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
         .await?;
     env.d1("DB")?
         .prepare("INSERT INTO staged_media(object_key,byte_size,content_type) VALUES(?1,?2,?3)")
-        .bind(&[key.clone().into(), (bytes.len() as i64).into(), mime.into()])?
+        .bind(&[key.clone().into(), (bytes.len() as i32).into(), mime.into()])?
         .run()
         .await?;
     Response::from_json(
@@ -584,7 +584,7 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         .await?
         .results::<serde_json::Value>()?;
     let mut statements = vec![db.prepare("INSERT INTO products(id,category_id,slug,title,summary,content,status,source_url,sort_order,version) VALUES(?1,?2,?3,?4,?5,?6,?7,NULLIF(?8,''),?9,1) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,slug=excluded.slug,title=excluded.title,summary=excluded.summary,content=excluded.content,status=excluded.status,source_url=excluded.source_url,sort_order=excluded.sort_order,version=products.version+1 WHERE products.version=?10")
-        .bind(&[id.into(),category.into(),slug.into(),title.into(),summary.into(),content.into(),status.into(),source.into(),sort_order.into(),expected.unwrap_or(0).into()])?,
+        .bind(&[id.into(),category.into(),slug.into(),title.into(),summary.into(),content.into(),status.into(),source.into(),(sort_order as i32).into(),(expected.unwrap_or(0) as i32).into()])?,
         db.prepare("DELETE FROM product_specs WHERE product_id=?1").bind(&[id.into()])?,
         db.prepare("DELETE FROM product_media WHERE product_id=?1").bind(&[id.into()])?];
     for (index, spec) in specs.iter().enumerate() {
@@ -606,19 +606,19 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         } else {
             spec_id
         };
-        statements.push(db.prepare("INSERT INTO product_specs(id,product_id,label,value,unit,sort_order) VALUES(?1,?2,?3,?4,?5,?6)").bind(&[spec_id.into(),id.into(),label.trim().into(),value.trim().into(),unit.into(),(index as i64).into()])?);
+        statements.push(db.prepare("INSERT INTO product_specs(id,product_id,label,value,unit,sort_order) VALUES(?1,?2,?3,?4,?5,?6)").bind(&[spec_id.into(),id.into(),label.trim().into(),value.trim().into(),unit.into(),(index as i32).into()])?);
     }
     for (index, image) in media.iter().enumerate() {
         let key = image["storage_path"].as_str().unwrap_or("");
         let image_id = image["id"].as_str().unwrap_or("");
         let alt = image["alt_text"].as_str().unwrap_or("");
         let byte_size = image["byte_size"].as_i64().unwrap_or(0);
-        if !key.starts_with("products/") || image_id.is_empty() || alt.len() > 500 || byte_size < 0
+        if !key.starts_with("products/") || image_id.is_empty() || alt.len() > 500 || !(0..=i32::MAX as i64).contains(&byte_size)
         {
             return Response::error("Invalid image metadata", 400);
         }
         statements.push(db.prepare("INSERT INTO product_media(id,product_id,object_key,alt_text,sort_order,byte_size) VALUES(?1,?2,?3,?4,?5,?6)")
-            .bind(&[image_id.into(),id.into(),key.into(),alt.into(),(index as i64).into(),byte_size.into()])?);
+            .bind(&[image_id.into(),id.into(),key.into(),alt.into(),(index as i32).into(),(byte_size as i32).into()])?);
         statements.push(
             db.prepare("DELETE FROM staged_media WHERE object_key=?1")
                 .bind(&[key.into()])?,
@@ -669,7 +669,7 @@ async fn delete_product(path: &str, mut req: Request, env: &Env) -> Result<Respo
         .await?
         .results::<serde_json::Value>()?;
     db.prepare("DELETE FROM products WHERE id=?1 AND version=?2")
-        .bind(&[id.into(), version.into()])?
+        .bind(&[id.into(), (version as i32).into()])?
         .run()
         .await?;
     let removed_paths: Vec<_> = rows
@@ -717,7 +717,7 @@ async fn save_slide(mut req: Request, env: &Env) -> Result<Response> {
         return Response::error("Invalid slide", 400);
     }
     env.d1("DB")?.prepare("INSERT INTO hero_slides(id,object_key,alt_text,is_active,sort_order,byte_size) VALUES(?1,?2,?3,?4,?5,COALESCE((SELECT byte_size FROM staged_media WHERE object_key=?2),0))")
-        .bind(&[id.into(),key.into(),alt.into(),(if value["is_active"].as_bool().unwrap_or(true) {1_i64} else {0_i64}).into(),order.into()])?.run().await?;
+        .bind(&[id.into(),key.into(),alt.into(),(if value["is_active"].as_bool().unwrap_or(true) {1_i32} else {0_i32}).into(),(order as i32).into()])?.run().await?;
     env.d1("DB")?
         .prepare("DELETE FROM staged_media WHERE object_key=?1")
         .bind(&[key.into()])?
@@ -739,15 +739,15 @@ async fn update_slide(path: &str, mut req: Request, env: &Env) -> Result<Respons
     let order = value["sort_order"].as_i64().unwrap_or(-1);
     let version = value["expected_version"].as_i64().unwrap_or(0);
     let active = if value["is_active"].as_bool().unwrap_or(false) {
-        1_i64
+        1_i32
     } else {
-        0_i64
+        0_i32
     };
     if !key.starts_with("slides/") || alt.len() > 500 || !(0..=1_000_000).contains(&order) {
         return Response::error("Invalid slide", 400);
     }
     let result = env.d1("DB")?.prepare("UPDATE hero_slides SET object_key=?1,alt_text=?2,is_active=?3,sort_order=?4,byte_size=COALESCE((SELECT byte_size FROM staged_media WHERE object_key=?1),byte_size),version=version+1 WHERE id=?5 AND version=?6")
-        .bind(&[key.into(),alt.into(),active.into(),order.into(),id.into(),version.into()])?.run().await?;
+        .bind(&[key.into(),alt.into(),active.into(),(order as i32).into(),id.into(),(version as i32).into()])?.run().await?;
     if !result
         .meta()?
         .is_some_and(|meta| meta.changes.unwrap_or(0) > 0)
@@ -774,7 +774,7 @@ async fn delete_slide(path: &str, mut req: Request, env: &Env) -> Result<Respons
     let row = env
         .d1("DB")?
         .prepare("SELECT object_key FROM hero_slides WHERE id=?1 AND version=?2")
-        .bind(&[id.into(), version.into()])?
+        .bind(&[id.into(), (version as i32).into()])?
         .first::<serde_json::Value>(None)
         .await?;
     let Some(row) = row else {
@@ -782,7 +782,7 @@ async fn delete_slide(path: &str, mut req: Request, env: &Env) -> Result<Respons
     };
     env.d1("DB")?
         .prepare("DELETE FROM hero_slides WHERE id=?1 AND version=?2")
-        .bind(&[id.into(), version.into()])?
+        .bind(&[id.into(), (version as i32).into()])?
         .run()
         .await?;
     Response::from_json(&serde_json::json!({"deleted":true,"removed_paths":[row["object_key"]]}))
