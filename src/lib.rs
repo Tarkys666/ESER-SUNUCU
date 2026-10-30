@@ -6,14 +6,24 @@ use worker::*;
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
+    let method = req.method();
     let origin = req.headers().get("Origin")?;
     if req.method() == Method::Options {
         return cors(Response::empty()?, origin.as_deref(), &env);
     }
-    let response = match (req.method(), path.as_str()) {
+    let cache_key = public_cache_key(&req, &path)?;
+    let invalidate_cache = path.starts_with("/api/admin/")
+        && matches!(method, Method::Post | Method::Put | Method::Delete);
+    if let Some(key) = cache_key.as_deref() {
+        if let Ok(Some(response)) = Cache::default().get(key, false).await {
+            return cors(response, origin.as_deref(), &env);
+        }
+    }
+    let mut response = match (method.clone(), path.as_str()) {
         (Method::Get, "/api/health") => Response::ok(r#"{"ok":true}"#),
+        (Method::Get, "/api/home") => home(&env).await,
         (Method::Get, "/api/categories") => categories(&env).await,
-        (Method::Get, "/api/products") => products(&env).await,
+        (Method::Get, "/api/products") => products(&req, &env).await,
         (Method::Get, "/api/slides") => slides(&env).await,
         (Method::Post, "/api/admin/login") => login(req, &env).await,
         (Method::Get, "/api/admin/me") => admin_me(&req, &env).await,
@@ -25,6 +35,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Post, "/api/admin/slides") => save_slide(req, &env).await,
         (Method::Get, "/api/admin/usage") => admin_usage(&req, &env).await,
         (Method::Post, "/api/admin/categories") => save_category(req, &env).await,
+        (Method::Put, path) if path.starts_with("/api/admin/categories/") => {
+            update_category(path, req, &env).await
+        }
         (Method::Post, "/api/admin/media") => upload_media(req, &env).await,
         (Method::Delete, "/api/admin/media") => delete_media(&req, &env).await,
         (Method::Get, path) if path.starts_with("/api/media/") => {
@@ -53,25 +66,126 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             404,
         ),
     }?;
+    if path.starts_with("/api/admin/") || response.status_code() >= 400 {
+        response.headers_mut().set("Cache-Control", "no-store")?;
+    }
+    if invalidate_cache && response.status_code() < 400 {
+        let _ = clear_home_cache().await;
+    }
+    if let Some(key) = cache_key.filter(|_| response.status_code() == 200) {
+        if let Ok(mut cacheable) = response.cloned() {
+            let cache_control = if path.starts_with("/api/media/") {
+                "public, max-age=300, s-maxage=300"
+            } else {
+                "public, max-age=0, s-maxage=60"
+            };
+            let _ = cacheable.headers_mut().set("Cache-Control", cache_control);
+            let _ = Cache::default().put(key, cacheable).await;
+        }
+    }
     cors(response, origin.as_deref(), &env)
 }
 
-async fn products(env: &Env) -> Result<Response> {
-    let rows = env.d1("DB")?.prepare("SELECT p.id,p.slug,p.title,p.category_id,p.source_url,p.summary,c.name AS category_name,p.sort_order FROM products p JOIN categories c ON c.id=p.category_id WHERE p.status='published' ORDER BY p.sort_order,p.id")
-        .all().await?.results::<serde_json::Value>()?;
-    let mut output = Vec::with_capacity(rows.len());
-    for mut product in rows {
-        let id = product["id"].as_str().unwrap_or_default();
-        let media = env.d1("DB")?.prepare("SELECT id,object_key AS storage_path,alt_text,sort_order FROM product_media WHERE product_id=?1 ORDER BY sort_order,id").bind(&[id.into()])?.all().await?.results::<serde_json::Value>()?;
-        if let Some(object) = product.as_object_mut() {
-            object.insert(
-                "product_media".into(),
-                serde_json::Value::Array(media.into_iter().map(add_media_url).collect()),
-            );
-        }
-        output.push(product);
+async fn clear_home_cache() -> Result<()> {
+    let cache = Cache::default();
+    for path in [
+        "/api/home",
+        "/api/categories",
+        "/api/slides",
+        "/api/products",
+    ] {
+        let _ = cache
+            .delete(
+                format!("https://dilekmakina-cache.internal/v1{path}"),
+                false,
+            )
+            .await?;
     }
-    Response::from_json(&output)
+    Ok(())
+}
+
+fn public_cache_key(req: &Request, path: &str) -> Result<Option<String>> {
+    if req.method() != Method::Get || req.headers().get("Authorization")?.is_some() {
+        return Ok(None);
+    }
+    let url = req.url()?;
+    let query = url.query();
+    let allowed = match path {
+        "/api/home" | "/api/categories" | "/api/slides" => query.is_none(),
+        "/api/products" => query
+            .map(|value| value.len() <= 300 && !value.split('&').any(|pair| pair.starts_with("q=")))
+            .unwrap_or(true),
+        _ if path.starts_with("/api/media/") || path.starts_with("/api/products/") => {
+            query.is_none()
+        }
+        _ => false,
+    };
+    Ok(allowed.then(|| {
+        format!(
+            "https://dilekmakina-cache.internal/v1{path}{}",
+            query.map(|q| format!("?{q}")).unwrap_or_default()
+        )
+    }))
+}
+
+async fn products(req: &Request, env: &Env) -> Result<Response> {
+    let params: std::collections::HashMap<String, String> = req.query()?;
+    let page = params
+        .get("page")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 100_000);
+    let category = params.get("category").map(String::as_str).unwrap_or("");
+    let query = params
+        .get("q")
+        .map(|s| s.chars().take(100).collect::<String>())
+        .unwrap_or_default();
+    let search = format!("%{query}%");
+    let db = env.d1("DB")?;
+    let total = db
+        .prepare(
+            "SELECT COUNT(*) AS n FROM products WHERE status='published' AND (?1='' OR category_id=?1) AND (?2='' OR title LIKE ?3 OR summary LIKE ?3 OR category_id IN (SELECT id FROM categories WHERE name LIKE ?3))",
+        )
+        .bind(&[category.into(), query.as_str().into(), search.as_str().into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .and_then(|row| row["n"].as_u64())
+        .unwrap_or(0);
+    let offset = (page - 1) * 24;
+    let rows = db
+        .prepare(
+            "SELECT p.id,p.slug,p.title,p.category_id,p.source_url,p.summary,c.name AS category_name,p.sort_order,m.id AS media_id,m.object_key AS storage_path,m.alt_text,m.sort_order AS media_sort FROM products p JOIN categories c ON c.id=p.category_id LEFT JOIN product_media m ON m.id=(SELECT pm.id FROM product_media pm WHERE pm.product_id=p.id ORDER BY pm.sort_order,pm.id LIMIT 1) WHERE p.status='published' AND (?1='' OR p.category_id=?1) AND (?2='' OR p.title LIKE ?3 OR p.summary LIKE ?3 OR c.name LIKE ?3) ORDER BY p.sort_order,p.id LIMIT 24 OFFSET ?4",
+        )
+        .bind(&[
+            category.into(),
+            query.as_str().into(),
+            search.as_str().into(),
+            (offset as i32).into(),
+        ])?
+        .all()
+        .await?
+        .results::<serde_json::Value>()?;
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|mut row| {
+            let media = if row["media_id"].is_string() {
+                let media = serde_json::json!({"id":row["media_id"],"storage_path":row["storage_path"],"alt_text":row["alt_text"],"sort_order":row["media_sort"]});
+                vec![add_media_url(media)]
+            } else {
+                Vec::new()
+            };
+            if let Some(object) = row.as_object_mut() {
+                for key in ["media_id", "storage_path", "alt_text", "media_sort"] {
+                    object.remove(key);
+                }
+                object.insert("product_media".into(), serde_json::Value::Array(media));
+            }
+            row
+        })
+        .collect();
+    Response::from_json(
+        &serde_json::json!({"items":items,"total":total,"page":page,"page_size":24}),
+    )
 }
 
 fn add_media_url(mut media: serde_json::Value) -> serde_json::Value {
@@ -139,7 +253,112 @@ async fn slides(env: &Env) -> Result<Response> {
     Response::from_json(&rows)
 }
 
+async fn home(env: &Env) -> Result<Response> {
+    let categories = env
+        .d1("DB")?
+        .prepare(
+            r#"SELECT c.id,c.name,c.sort_order,
+                      COALESCE(selected.id,fallback.id) AS product_id,
+                      COALESCE(selected.slug,fallback.slug) AS product_slug,
+                      COALESCE(selected.title,fallback.title) AS product_title,
+                      COALESCE(selected_media.object_key,fallback_media.object_key) AS image_path,
+                      COALESCE(selected_media.alt_text,fallback_media.alt_text) AS alt_text
+               FROM categories c
+               LEFT JOIN products selected
+                 ON selected.id=c.featured_product_id AND selected.category_id=c.id AND selected.status='published'
+               LEFT JOIN products fallback ON fallback.id=(
+                 SELECT p.id FROM products p
+                 WHERE p.category_id=c.id AND p.status='published'
+                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM product_media pm WHERE pm.product_id=p.id) THEN 0 ELSE 1 END,
+                          p.sort_order,p.id
+                 LIMIT 1
+               )
+               LEFT JOIN product_media selected_media ON selected_media.id=(
+                 SELECT pm.id FROM product_media pm WHERE pm.product_id=selected.id ORDER BY pm.sort_order,pm.id LIMIT 1
+               )
+               LEFT JOIN product_media fallback_media ON fallback_media.id=(
+                 SELECT pm.id FROM product_media pm WHERE pm.product_id=fallback.id ORDER BY pm.sort_order,pm.id LIMIT 1
+               )
+               ORDER BY c.sort_order,c.id"#,
+        )
+        .all().await?.results::<serde_json::Value>()?;
+    let categories: Vec<_> = categories.into_iter().map(|mut category| {
+        if category["product_id"].is_string() {
+            let product = serde_json::json!({"id":category["product_id"],"slug":category["product_slug"],"title":category["product_title"],"image_path":category["image_path"],"alt_text":category["alt_text"]});
+            if let Some(object) = category.as_object_mut() {
+                for key in ["product_id", "product_slug", "product_title", "image_path", "alt_text"] { object.remove(key); }
+                object.insert("featured_product".into(), product);
+            }
+        } else if let Some(object) = category.as_object_mut() {
+            for key in ["product_id", "product_slug", "product_title", "image_path", "alt_text"] { object.remove(key); }
+            object.insert("featured_product".into(), serde_json::Value::Null);
+        }
+        if let Some(product) = category.get_mut("featured_product").filter(|v| !v.is_null()) {
+            if let Some(key) = product.get("image_path").and_then(|v| v.as_str()).map(str::to_owned) {
+                if let Some(object) = product.as_object_mut() { object.insert("url".into(), serde_json::json!(format!("/api/media/{}", key.split('/').map(urlencoding).collect::<Vec<_>>().join("/")))); }
+            }
+        }
+        category
+    }).collect();
+    let slides = env.d1("DB")?.prepare("SELECT id,object_key AS image_path,alt_text,sort_order FROM hero_slides WHERE is_active=1 ORDER BY sort_order,id")
+        .all().await?.results::<serde_json::Value>()?;
+    let slides: Vec<_> = slides
+        .into_iter()
+        .map(|mut slide| {
+            if let Some(key) = slide["image_path"].as_str().map(str::to_owned) {
+                if let Some(object) = slide.as_object_mut() {
+                    object.insert(
+                        "url".into(),
+                        serde_json::json!(format!(
+                            "/api/media/{}",
+                            key.split('/')
+                                .map(urlencoding)
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        )),
+                    );
+                }
+            }
+            slide
+        })
+        .collect();
+    Response::from_json(&serde_json::json!({"categories":categories,"slides":slides}))
+}
+
 async fn login(mut req: Request, env: &Env) -> Result<Response> {
+    let ip = req
+        .headers()
+        .get("CF-Connecting-IP")?
+        .unwrap_or_else(|| "local".to_owned());
+    let session_secret = required_secret(env, "SESSION_SECRET").await?;
+    let mut ip_mac = Hmac::<Sha256>::new_from_slice(session_secret.as_bytes())
+        .map_err(|_| Error::RustError("Invalid session secret".into()))?;
+    ip_mac.update(b"admin-login-ip:");
+    ip_mac.update(ip.as_bytes());
+    let ip_key = URL_SAFE_NO_PAD.encode(ip_mac.finalize().into_bytes());
+    let now = (Date::now().as_millis() as u64 / 1000) as i64;
+    let db = env.d1("DB")?;
+    let locked_until = db
+        .prepare("SELECT locked_until FROM admin_login_locks WHERE ip_key=?1")
+        .bind(&[ip_key.as_str().into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .and_then(|row| row["locked_until"].as_i64());
+    if let Some(until) = locked_until.filter(|until| *until > now) {
+        let mut response = Response::error(
+            r#"{"error":{"code":"LOGIN_LOCKED","message":"Çok fazla hatalı giriş. 10 dakika sonra tekrar deneyin."}}"#,
+            429,
+        )?;
+        response
+            .headers_mut()
+            .set("Retry-After", &(until - now).to_string())?;
+        return Ok(response);
+    }
+    db.prepare("DELETE FROM admin_login_locks WHERE locked_until<=?1")
+        .bind(&[now.into()])?
+        .run()
+        .await?;
+
     let credentials: serde_json::Value = req.json().await?;
     let email = credentials
         .get("email")
@@ -157,16 +376,23 @@ async fn login(mut req: Request, env: &Env) -> Result<Response> {
     if !constant_eq(email.as_bytes(), expected_email.as_bytes())
         || !constant_eq(password.as_bytes(), expected_password.as_bytes())
     {
+        db.prepare("INSERT INTO admin_login_locks(ip_key,locked_until) VALUES(?1,?2) ON CONFLICT(ip_key) DO UPDATE SET locked_until=excluded.locked_until")
+            .bind(&[ip_key.as_str().into(), (now + 600).into()])?
+            .run()
+            .await?;
         return Response::error(
             r#"{"error":{"code":"UNAUTHORIZED","message":"E-posta veya şifre hatalı"}}"#,
             401,
         );
     }
+    db.prepare("DELETE FROM admin_login_locks WHERE ip_key=?1")
+        .bind(&[ip_key.as_str().into()])?
+        .run()
+        .await?;
     let expires = (Date::now().as_millis() as u64 / 1000) + 8 * 60 * 60;
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(
         &serde_json::json!({"sub": expected_email, "exp": expires}),
     )?);
-    let session_secret = required_secret(env, "SESSION_SECRET").await?;
     let mut mac = Hmac::<Sha256>::new_from_slice(session_secret.as_bytes())
         .map_err(|_| Error::RustError("Invalid session secret".into()))?;
     mac.update(payload.as_bytes());
@@ -360,6 +586,51 @@ async fn save_category(mut req: Request, env: &Env) -> Result<Response> {
     Response::from_json(&serde_json::json!({"id":id,"name":name,"sort_order":order,"version":1}))
 }
 
+async fn update_category(path: &str, mut req: Request, env: &Env) -> Result<Response> {
+    if !authorized(&req, env).await? {
+        return unauthorized();
+    }
+    let id = path.trim_start_matches("/api/admin/categories/");
+    let body: serde_json::Value = req.json().await?;
+    let product_id = body["featured_product_id"].as_str().unwrap_or("");
+    if !product_id.is_empty() {
+        let valid = env
+            .d1("DB")?
+            .prepare("SELECT 1 FROM products WHERE id=?1 AND category_id=?2 AND status='published'")
+            .bind(&[product_id.into(), id.into()])?
+            .first::<serde_json::Value>(None)
+            .await?
+            .is_some();
+        if !valid {
+            return Response::error(
+                r#"{"error":{"code":"INVALID_FEATURED_PRODUCT","message":"Yalnızca aynı kategorideki yayındaki bir ürün seçilebilir"}}"#,
+                400,
+            );
+        }
+    }
+    let exists = env
+        .d1("DB")?
+        .prepare("SELECT 1 FROM categories WHERE id=?1")
+        .bind(&[id.into()])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .is_some();
+    if !exists {
+        return Response::error(
+            r#"{"error":{"code":"NOT_FOUND","message":"Kategori bulunamadı"}}"#,
+            404,
+        );
+    }
+    env.d1("DB")?
+        .prepare("UPDATE categories SET featured_product_id=NULLIF(?2,'') WHERE id=?1")
+        .bind(&[id.into(), product_id.into()])?
+        .run()
+        .await?;
+    Response::from_json(
+        &serde_json::json!({"id":id,"featured_product_id":if product_id.is_empty(){serde_json::Value::Null}else{serde_json::json!(product_id)}}),
+    )
+}
+
 async fn delete_category(path: &str, req: &Request, env: &Env) -> Result<Response> {
     if !authorized(req, env).await? {
         return unauthorized();
@@ -523,9 +794,14 @@ async fn public_media(path: &str, req: &Request, env: &Env) -> Result<Response> 
     if let Some(content_type) = metadata.content_type {
         response.headers_mut().set("Content-Type", &content_type)?;
     }
-    response
-        .headers_mut()
-        .set("Cache-Control", "public, max-age=3600")?;
+    response.headers_mut().set(
+        "Cache-Control",
+        if public {
+            "public, max-age=300"
+        } else {
+            "private, no-store"
+        },
+    )?;
     Ok(response)
 }
 
@@ -593,6 +869,7 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         .results::<serde_json::Value>()?;
     let mut statements = vec![db.prepare("INSERT INTO products(id,category_id,slug,title,summary,content,status,source_url,sort_order,trendyol_url,idefix_url,hepsiburada_url,pazarama_url,n11_url,version) VALUES(?1,?2,?3,?4,?5,?6,?7,NULLIF(?8,''),?9,NULLIF(?10,''),NULLIF(?11,''),NULLIF(?12,''),NULLIF(?13,''),NULLIF(?14,''),1) ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,slug=excluded.slug,title=excluded.title,summary=excluded.summary,content=excluded.content,status=excluded.status,source_url=excluded.source_url,sort_order=excluded.sort_order,trendyol_url=excluded.trendyol_url,idefix_url=excluded.idefix_url,hepsiburada_url=excluded.hepsiburada_url,pazarama_url=excluded.pazarama_url,n11_url=excluded.n11_url,version=products.version+1 WHERE products.version=?15")
         .bind(&[id.into(),category.into(),slug.into(),title.into(),summary.into(),content.into(),status.into(),source.into(),(sort_order as i32).into(),trendyol.into(),idefix.into(),hepsiburada.into(),pazarama.into(),n11.into(),(expected.unwrap_or(0) as i32).into()])?,
+        db.prepare("UPDATE categories SET featured_product_id=NULL WHERE featured_product_id=?1 AND NOT EXISTS(SELECT 1 FROM products p WHERE p.id=?1 AND p.category_id=categories.id AND p.status='published')").bind(&[id.into()])?,
         db.prepare("DELETE FROM product_specs WHERE product_id=?1").bind(&[id.into()])?,
         db.prepare("DELETE FROM product_media WHERE product_id=?1").bind(&[id.into()])?];
     for (index, spec) in specs.iter().enumerate() {
@@ -621,7 +898,10 @@ async fn save_product(mut req: Request, env: &Env) -> Result<Response> {
         let image_id = image["id"].as_str().unwrap_or("");
         let alt = image["alt_text"].as_str().unwrap_or("");
         let byte_size = image["byte_size"].as_i64().unwrap_or(0);
-        if !key.starts_with("products/") || image_id.is_empty() || alt.len() > 500 || !(0..=i32::MAX as i64).contains(&byte_size)
+        if !key.starts_with("products/")
+            || image_id.is_empty()
+            || alt.len() > 500
+            || !(0..=i32::MAX as i64).contains(&byte_size)
         {
             return Response::error("Invalid image metadata", 400);
         }
@@ -799,7 +1079,9 @@ async fn delete_slide(path: &str, mut req: Request, env: &Env) -> Result<Respons
 async fn categories(env: &Env) -> Result<Response> {
     let rows = env
         .d1("DB")?
-        .prepare("SELECT id,name,sort_order FROM categories ORDER BY sort_order,id")
+        .prepare(
+            "SELECT id,name,sort_order,featured_product_id FROM categories ORDER BY sort_order,id",
+        )
         .all()
         .await?
         .results::<serde_json::Value>()?;
