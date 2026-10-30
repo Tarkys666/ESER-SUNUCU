@@ -697,6 +697,7 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
     if bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 || !valid_image(&mime, &bytes) {
         return Response::error("Invalid image", 400);
     }
+    let byte_size = bytes.len();
     let nonce = format!(
         "{:x}-{:x}",
         Date::now().as_millis(),
@@ -713,7 +714,7 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
         ext
     );
     env.bucket("MEDIA")?
-        .put(&key, bytes.clone())
+        .put(&key, bytes)
         .http_metadata(HttpMetadata {
             content_type: Some(mime.clone()),
             ..Default::default()
@@ -722,11 +723,11 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
         .await?;
     env.d1("DB")?
         .prepare("INSERT INTO staged_media(object_key,byte_size,content_type) VALUES(?1,?2,?3)")
-        .bind(&[key.clone().into(), (bytes.len() as i32).into(), mime.into()])?
+        .bind(&[key.clone().into(), (byte_size as i32).into(), mime.into()])?
         .run()
         .await?;
     Response::from_json(
-        &serde_json::json!({"storage_path":key,"url":format!("/api/media/{key}"),"byte_size":bytes.len()}),
+        &serde_json::json!({"storage_path":key,"url":format!("/api/media/{key}"),"byte_size":byte_size}),
     )
 }
 
@@ -738,8 +739,9 @@ fn valid_image(mime: &str, bytes: &[u8]) -> bool {
         "image/avif" => {
             bytes.len() >= 12
                 && &bytes[4..8] == b"ftyp"
-                && (bytes.windows(4).any(|v| v == b"avif")
-                    || bytes.windows(4).any(|v| v == b"avis"))
+                && bytes[8..]
+                    .windows(4)
+                    .any(|v| v == b"avif" || v == b"avis")
         }
         _ => false,
     }
