@@ -5,10 +5,13 @@ workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
+database_name = "eser-sunucu-db"
+database_id = "c95d3ede-d542-4bfd-ae1b-55b77b28d7d4"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "MEDIA"
+bucket_name = "dilek-makina-media"
 
 [vars]
 ALLOWED_ORIGINS = "http://127.0.0.1:4173,http://localhost:4173,https://eser-web.pages.dev,https://dilekmakina.net"
