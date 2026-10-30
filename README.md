@@ -13,7 +13,7 @@ pnpm dev
 
 Worker `http://127.0.0.1:8787` adresinde açılır. D1/R2 verisi `.wrangler/` altında yerel tutulur. `wrangler.local.toml` ve migration komutundaki `--local` uzak Cloudflare hesabına erişmez. `.dev.vars` gizlidir ve Git'e eklenmez.
 
-Frontend `ESER WEB` reposunda `http://127.0.0.1:4173` üzerinde çalışır. Cloudflare Pages production origin'i `https://eser-web.pages.dev` olarak CORS listesine eklendi.
+Frontend `ESER WEB` reposunda `http://127.0.0.1:4173` üzerinde çalışır. Cloudflare Pages production origin'leri `https://eser-web.pages.dev` ve `https://dilekmakina.net` olarak CORS listesine eklendi.
 
 Cloudflare Secrets Store'da `ADMIN_EMAIL`, `ADMIN_PASSWORD` ve uzun, rastgele `SESSION_SECRET` adlarında, `workers` kapsamlı üç secret oluşturulmalıdır. Secret değerleri repoya veya sohbete yazılmaz. Yerelde aynı adları `.dev.vars` içine koy.
 
