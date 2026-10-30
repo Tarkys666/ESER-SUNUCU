@@ -1,0 +1,29 @@
+name = "eser-sunucu"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-30"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA"
+
+[vars]
+ALLOWED_ORIGINS = "http://127.0.0.1:4173,http://localhost:4173,https://eser-web.pages.dev"
+
+[[secrets_store_secrets]]
+binding = "ADMIN_EMAIL"
+store_id = "f0bce7d9d6ee4d2c857c22effd9a61a8"
+secret_name = "ADMIN_EMAIL"
+
+[[secrets_store_secrets]]
+binding = "ADMIN_PASSWORD"
+store_id = "f0bce7d9d6ee4d2c857c22effd9a61a8"
+secret_name = "ADMIN_PASSWORD"
+
+[[secrets_store_secrets]]
+binding = "SESSION_SECRET"
+store_id = "f0bce7d9d6ee4d2c857c22effd9a61a8"
+secret_name = "SESSION_SECRET"

@@ -1,0 +1,11 @@
+{
+  "name": "dilek-makina-worker",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --local --config wrangler.local.toml",
+    "db:migrate:local": "wrangler d1 migrations apply dilek-makina-local --local --config wrangler.local.toml"
+  },
+  "devDependencies": {
+    "wrangler": "4.155.0"
+  }
+}
