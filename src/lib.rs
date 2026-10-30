@@ -3,6 +3,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use worker::*;
 
+const PUBLIC_MEDIA_CACHE_CONTROL: &str = "public, max-age=31536000, s-maxage=31536000, immutable";
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
@@ -15,7 +17,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let invalidate_cache = path.starts_with("/api/admin/")
         && matches!(method, Method::Post | Method::Put | Method::Delete);
     if let Some(key) = cache_key.as_deref() {
-        if let Ok(Some(response)) = Cache::default().get(key, false).await {
+        if let Ok(Some(mut response)) = Cache::default().get(key, false).await {
+            if path.starts_with("/api/media/") {
+                response
+                    .headers_mut()
+                    .set("Cache-Control", PUBLIC_MEDIA_CACHE_CONTROL)?;
+            }
             return Ok(response);
         }
     }
@@ -76,7 +83,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if let Some(key) = cache_key.filter(|_| response.status_code() == 200) {
         if let Ok(mut cacheable) = response.cloned() {
             let cache_control = if path.starts_with("/api/media/") {
-                "public, max-age=300, s-maxage=300"
+                PUBLIC_MEDIA_CACHE_CONTROL
             } else {
                 "public, max-age=0, s-maxage=60"
             };
@@ -822,7 +829,7 @@ async fn public_media(path: &str, req: &Request, env: &Env) -> Result<Response> 
     response.headers_mut().set(
         "Cache-Control",
         if public {
-            "public, max-age=300"
+            PUBLIC_MEDIA_CACHE_CONTROL
         } else {
             "private, no-store"
         },
