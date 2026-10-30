@@ -11,12 +11,12 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == Method::Options {
         return cors(Response::empty()?, origin.as_deref(), &env);
     }
-    let cache_key = public_cache_key(&req, &path)?;
+    let cache_key = public_cache_key(&req, &path, origin.as_deref(), &env)?;
     let invalidate_cache = path.starts_with("/api/admin/")
         && matches!(method, Method::Post | Method::Put | Method::Delete);
     if let Some(key) = cache_key.as_deref() {
-        if let Ok(Some(mut response)) = Cache::default().get(key, false).await {
-            return cors(response.cloned()?, origin.as_deref(), &env);
+        if let Ok(Some(response)) = Cache::default().get(key, false).await {
+            return Ok(response);
         }
     }
     let mut response = match (method.clone(), path.as_str()) {
@@ -70,8 +70,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         response.headers_mut().set("Cache-Control", "no-store")?;
     }
     if invalidate_cache && response.status_code() < 400 {
-        let _ = clear_home_cache().await;
+        let _ = clear_home_cache(&env).await;
     }
+    response = cors(response, origin.as_deref(), &env)?;
     if let Some(key) = cache_key.filter(|_| response.status_code() == 200) {
         if let Ok(mut cacheable) = response.cloned() {
             let cache_control = if path.starts_with("/api/media/") {
@@ -83,28 +84,38 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let _ = Cache::default().put(key, cacheable).await;
         }
     }
-    cors(response, origin.as_deref(), &env)
+    Ok(response)
 }
 
-async fn clear_home_cache() -> Result<()> {
+async fn clear_home_cache(env: &Env) -> Result<()> {
     let cache = Cache::default();
+    let origins = env.var("ALLOWED_ORIGINS")?.to_string();
     for path in [
         "/api/home",
         "/api/categories",
         "/api/slides",
         "/api/products",
     ] {
-        let _ = cache
-            .delete(
-                format!("https://dilekmakina-cache.internal/v1{path}"),
-                false,
-            )
-            .await?;
+        let base = format!("https://dilekmakina-cache.internal/v1{path}");
+        let _ = cache.delete(base.clone(), false).await?;
+        for origin in origins.split(',').filter(|value| !value.is_empty()) {
+            let _ = cache
+                .delete(
+                    format!("{base}?__origin={}", urlencoding(origin)),
+                    false,
+                )
+                .await?;
+        }
     }
     Ok(())
 }
 
-fn public_cache_key(req: &Request, path: &str) -> Result<Option<String>> {
+fn public_cache_key(
+    req: &Request,
+    path: &str,
+    origin: Option<&str>,
+    env: &Env,
+) -> Result<Option<String>> {
     if req.method() != Method::Get || req.headers().get("Authorization")?.is_some() {
         return Ok(None);
     }
@@ -120,12 +131,24 @@ fn public_cache_key(req: &Request, path: &str) -> Result<Option<String>> {
         }
         _ => false,
     };
-    Ok(allowed.then(|| {
-        format!(
-            "https://dilekmakina-cache.internal/v1{path}{}",
-            query.map(|q| format!("?{q}")).unwrap_or_default()
-        )
-    }))
+    if !allowed {
+        return Ok(None);
+    }
+    let allowed_origins = env.var("ALLOWED_ORIGINS")?.to_string();
+    let cache_origin = origin.filter(|value| allowed_origins.split(',').any(|item| item == *value));
+    let query_string = query.map(|q| format!("?{q}")).unwrap_or_default();
+    let origin_suffix = cache_origin
+        .map(|value| {
+            format!(
+                "{}__origin={}",
+                if query_string.is_empty() { "?" } else { "&" },
+                urlencoding(value)
+            )
+        })
+        .unwrap_or_default();
+    Ok(Some(format!(
+        "https://dilekmakina-cache.internal/v1{path}{query_string}{origin_suffix}"
+    )))
 }
 
 async fn products(req: &Request, env: &Env) -> Result<Response> {
