@@ -248,7 +248,7 @@ async fn home(env: &Env) -> Result<Response> {
     let categories = env
         .d1("DB")?
         .prepare(
-            r#"SELECT c.id,c.name,c.sort_order,
+            r#"SELECT c.id,c.name,c.sort_order,c.cover_path,
                       COALESCE(selected.id,fallback.id) AS product_id,
                       COALESCE(selected.slug,fallback.slug) AS product_slug,
                       COALESCE(selected.title,fallback.title) AS product_title,
@@ -583,6 +583,22 @@ async fn update_category(path: &str, mut req: Request, env: &Env) -> Result<Resp
     }
     let id = path.trim_start_matches("/api/admin/categories/");
     let body: serde_json::Value = req.json().await?;
+    if let Some(cover) = body.get("cover_path") {
+        let key = cover.as_str().unwrap_or("");
+        if !cover.is_null() && !key.starts_with("categories/") {
+            return Response::error("Invalid category cover", 400);
+        }
+        let db = env.d1("DB")?;
+        if !key.is_empty() && env.bucket("MEDIA")?.head(key).await?.is_none() {
+            return Response::error("Cover not found", 400);
+        }
+        let exists = db.prepare("SELECT 1 FROM categories WHERE id=?1")
+            .bind(&[id.into()])?.first::<serde_json::Value>(None).await?.is_some();
+        if !exists { return Response::error("Category not found", 404); }
+        db.prepare("UPDATE categories SET cover_path=NULLIF(?2,'') WHERE id=?1")
+            .bind(&[id.into(),key.into()])?.run().await?;
+        return Response::from_json(&serde_json::json!({"id":id,"cover_path":cover}));
+    }
     let product_id = body["featured_product_id"].as_str().unwrap_or("");
     if !product_id.is_empty() {
         let valid = env
@@ -663,7 +679,7 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
         .find(|(key, _)| key == "kind")
         .map(|(_, value)| value.to_string())
         .unwrap_or_default();
-    if kind != "product" && kind != "slide" {
+    if kind != "product" && kind != "slide" && kind != "category" {
         return Response::error(
             r#"{"error":{"code":"INVALID_INPUT","message":"Görsel türü geçersiz"}}"#,
             400,
@@ -701,7 +717,9 @@ async fn upload_media(mut req: Request, env: &Env) -> Result<Response> {
     );
     let key = format!(
         "{}/{}.{}",
-        if kind == "slide" {
+        if kind == "category" {
+            "categories"
+        } else if kind == "slide" {
             "slides"
         } else {
             "products"
@@ -755,10 +773,10 @@ async fn delete_media(req: &Request, env: &Env) -> Result<Response> {
     else {
         return Response::error("Missing key", 400);
     };
-    if !key.starts_with("products/") && !key.starts_with("slides/") {
+    if !key.starts_with("products/") && !key.starts_with("slides/") && !key.starts_with("categories/") {
         return Response::error("Invalid key", 400);
     }
-    let attached = env.d1("DB")?.prepare("SELECT 1 FROM product_media WHERE object_key=?1 UNION ALL SELECT 1 FROM hero_slides WHERE object_key=?1 LIMIT 1")
+    let attached = env.d1("DB")?.prepare("SELECT 1 FROM product_media WHERE object_key=?1 UNION ALL SELECT 1 FROM hero_slides WHERE object_key=?1 UNION ALL SELECT 1 FROM categories WHERE cover_path=?1 LIMIT 1")
         .bind(&[key.clone().into()])?.first::<serde_json::Value>(None).await?.is_some();
     if attached {
         return Response::error("Media is still in use", 409);
@@ -774,7 +792,7 @@ async fn delete_media(req: &Request, env: &Env) -> Result<Response> {
 
 async fn public_media(path: &str, req: &Request, env: &Env) -> Result<Response> {
     let key = path.trim_start_matches("/api/media/");
-    let public = env.d1("DB")?.prepare("SELECT 1 FROM product_media m JOIN products p ON p.id=m.product_id WHERE m.object_key=?1 AND p.status='published' UNION ALL SELECT 1 FROM hero_slides WHERE object_key=?1 AND is_active=1 LIMIT 1")
+    let public = env.d1("DB")?.prepare("SELECT 1 FROM product_media m JOIN products p ON p.id=m.product_id WHERE m.object_key=?1 AND p.status='published' UNION ALL SELECT 1 FROM hero_slides WHERE object_key=?1 AND is_active=1 UNION ALL SELECT 1 FROM categories WHERE cover_path=?1 LIMIT 1")
         .bind(&[key.into()])?.first::<serde_json::Value>(None).await?.is_some();
     if !public && !authorized(req, env).await? {
         return Response::error("Not found", 404);
@@ -1078,7 +1096,7 @@ async fn categories(env: &Env) -> Result<Response> {
     let rows = env
         .d1("DB")?
         .prepare(
-            "SELECT id,name,sort_order,featured_product_id FROM categories ORDER BY sort_order,id",
+            "SELECT id,name,sort_order,featured_product_id,cover_path FROM categories ORDER BY sort_order,id",
         )
         .all()
         .await?
