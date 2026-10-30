@@ -14,15 +14,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return cors(Response::empty()?, origin.as_deref(), &env);
     }
     let cache_key = public_cache_key(&req, &path, origin.as_deref(), &env)?;
-    let invalidate_cache = path.starts_with("/api/admin/")
-        && matches!(method, Method::Post | Method::Put | Method::Delete);
     if let Some(key) = cache_key.as_deref() {
-        if let Ok(Some(mut response)) = Cache::default().get(key, false).await {
-            if path.starts_with("/api/media/") {
-                response
-                    .headers_mut()
-                    .set("Cache-Control", PUBLIC_MEDIA_CACHE_CONTROL)?;
-            }
+        if let Ok(Some(response)) = Cache::default().get(key, false).await {
             return Ok(response);
         }
     }
@@ -72,12 +65,11 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             r#"{"error":{"code":"NOT_FOUND","message":"Bulunamadı"}}"#,
             404,
         ),
-    }?;
-    if path.starts_with("/api/admin/") || response.status_code() >= 400 {
+    }.unwrap_or_else(|_| {
+        Response::error(r#"{"error":{"code":"INTERNAL_ERROR","message":"İşlem tamamlanamadı. Lütfen tekrar deneyin."}}"#, 500).unwrap()
+    });
+    if !path.starts_with("/api/media/") || response.status_code() >= 400 {
         response.headers_mut().set("Cache-Control", "no-store")?;
-    }
-    if invalidate_cache && response.status_code() < 400 {
-        let _ = clear_home_cache(&env).await;
     }
     response = cors(response, origin.as_deref(), &env)?;
     if let Some(key) = cache_key.filter(|_| response.status_code() == 200) {
@@ -94,29 +86,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     Ok(response)
 }
 
-async fn clear_home_cache(env: &Env) -> Result<()> {
-    let cache = Cache::default();
-    let origins = env.var("ALLOWED_ORIGINS")?.to_string();
-    for path in [
-        "/api/home",
-        "/api/categories",
-        "/api/slides",
-        "/api/products",
-    ] {
-        let base = format!("https://dilekmakina-cache.internal/v1{path}");
-        let _ = cache.delete(base.clone(), false).await?;
-        for origin in origins.split(',').filter(|value| !value.is_empty()) {
-            let _ = cache
-                .delete(
-                    format!("{base}?__origin={}", urlencoding(origin)),
-                    false,
-                )
-                .await?;
-        }
-    }
-    Ok(())
-}
-
 fn public_cache_key(
     req: &Request,
     path: &str,
@@ -128,16 +97,8 @@ fn public_cache_key(
     }
     let url = req.url()?;
     let query = url.query();
-    let allowed = match path {
-        "/api/home" | "/api/categories" | "/api/slides" => query.is_none(),
-        "/api/products" => query
-            .map(|value| value.len() <= 300 && !value.split('&').any(|pair| pair.starts_with("q=")))
-            .unwrap_or(true),
-        _ if path.starts_with("/api/media/") || path.starts_with("/api/products/") => {
-            query.is_none()
-        }
-        _ => false,
-    };
+    // Cache immutable media only; catalog reads must reflect admin writes globally.
+    let allowed = path.starts_with("/api/media/") && query.is_none();
     if !allowed {
         return Ok(None);
     }
@@ -154,7 +115,7 @@ fn public_cache_key(
         })
         .unwrap_or_default();
     Ok(Some(format!(
-        "https://dilekmakina-cache.internal/v1{path}{query_string}{origin_suffix}"
+        "https://dilekmakina-cache.internal/v2{path}{query_string}{origin_suffix}"
     )))
 }
 
@@ -679,8 +640,13 @@ async fn delete_category(path: &str, req: &Request, env: &Env) -> Result<Respons
             404,
         );
     }
-    env.d1("DB")?
-        .prepare("DELETE FROM categories WHERE id=?1")
+    let db = env.d1("DB")?;
+    let in_use = db.prepare("SELECT 1 FROM products WHERE category_id=?1 LIMIT 1")
+        .bind(&[id.into()])?.first::<serde_json::Value>(None).await?.is_some();
+    if in_use {
+        return Response::error(r#"{"error":{"code":"CATEGORY_IN_USE","message":"Bu kategoride ürün var. Önce ürünleri başka kategoriye taşıyın veya silin."}}"#, 409);
+    }
+    db.prepare("DELETE FROM categories WHERE id=?1")
         .bind(&[id.into()])?
         .run()
         .await?;
