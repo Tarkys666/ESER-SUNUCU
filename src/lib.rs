@@ -15,8 +15,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let invalidate_cache = path.starts_with("/api/admin/")
         && matches!(method, Method::Post | Method::Put | Method::Delete);
     if let Some(key) = cache_key.as_deref() {
-        if let Ok(Some(response)) = Cache::default().get(key, false).await {
-            return cors(response, origin.as_deref(), &env);
+        if let Ok(Some(mut response)) = Cache::default().get(key, false).await {
+            return cors(response.cloned()?, origin.as_deref(), &env);
         }
     }
     let mut response = match (method.clone(), path.as_str()) {
