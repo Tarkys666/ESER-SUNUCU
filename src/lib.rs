@@ -346,7 +346,7 @@ async fn login(mut req: Request, env: &Env) -> Result<Response> {
         return Ok(response);
     }
     db.prepare("DELETE FROM admin_login_locks WHERE locked_until<=?1")
-        .bind(&[now.into()])?
+        .bind(&[(now as f64).into()])?
         .run()
         .await?;
 
@@ -368,7 +368,7 @@ async fn login(mut req: Request, env: &Env) -> Result<Response> {
         || !constant_eq(password.as_bytes(), expected_password.as_bytes())
     {
         db.prepare("INSERT INTO admin_login_locks(ip_key,locked_until) VALUES(?1,?2) ON CONFLICT(ip_key) DO UPDATE SET locked_until=excluded.locked_until")
-            .bind(&[ip_key.as_str().into(), (now + 600).into()])?
+            .bind(&[ip_key.as_str().into(), ((now + 600) as f64).into()])?
             .run()
             .await?;
         return Response::error(
