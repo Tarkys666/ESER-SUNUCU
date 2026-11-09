@@ -30,6 +30,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Post, "/api/admin/logout") => Response::from_json(&serde_json::json!({"ok":true})),
         (Method::Get, "/api/admin/categories") => admin_categories(&req, &env).await,
         (Method::Get, "/api/admin/products") => admin_products(&req, &env).await,
+        (Method::Get, "/api/admin/analytics/products") => admin_product_analytics(&req, &env).await,
         (Method::Post, "/api/admin/products") => save_product(req, &env).await,
         (Method::Get, "/api/admin/slides") => admin_slides(&req, &env).await,
         (Method::Post, "/api/admin/slides") => save_slide(req, &env).await,
@@ -207,6 +208,11 @@ async fn product_detail(path: &str, env: &Env) -> Result<Response> {
     let id = product["id"].as_str().unwrap_or_default();
     let specs = env.d1("DB")?.prepare("SELECT id,label,value,unit,sort_order FROM product_specs WHERE product_id=?1 ORDER BY sort_order,id").bind(&[id.into()])?.all().await?.results::<serde_json::Value>()?;
     let media = env.d1("DB")?.prepare("SELECT id,object_key AS storage_path,alt_text,sort_order,byte_size FROM product_media WHERE product_id=?1 ORDER BY sort_order,id").bind(&[id.into()])?.all().await?.results::<serde_json::Value>()?;
+    let _ = env.d1("DB")?
+        .prepare("INSERT INTO product_view_daily(product_id,view_date,view_count) VALUES(?1,date('now'),1) ON CONFLICT(product_id,view_date) DO UPDATE SET view_count=product_view_daily.view_count+1")
+        .bind(&[id.into()])?
+        .run()
+        .await;
     if let Some(object) = product.as_object_mut() {
         object.insert("product_specs".into(), serde_json::Value::Array(specs));
         object.insert(
@@ -496,6 +502,24 @@ async fn admin_products(req: &Request, env: &Env) -> Result<Response> {
     let rows = env.d1("DB")?.prepare("SELECT id,slug,title,category_id,source_url,summary,status,sort_order,version FROM products ORDER BY sort_order,id")
         .all().await?.results::<serde_json::Value>()?;
     Response::from_json(&rows)
+}
+
+async fn admin_product_analytics(req: &Request, env: &Env) -> Result<Response> {
+    if !authorized(req, env).await? {
+        return unauthorized();
+    }
+    let params: std::collections::HashMap<String, String> = req.query()?;
+    let range = params.get("range").map(String::as_str).unwrap_or("30");
+    let date_filter = match range {
+        "7" => "AND v.view_date >= date('now','-6 days')",
+        "30" => "AND v.view_date >= date('now','-29 days')",
+        "90" => "AND v.view_date >= date('now','-89 days')",
+        "all" => "",
+        _ => return Response::error("Invalid analytics range", 400),
+    };
+    let query = format!("SELECT p.id,p.title,COALESCE(SUM(v.view_count),0) AS views FROM products p LEFT JOIN product_view_daily v ON v.product_id=p.id {date_filter} WHERE p.status='published' GROUP BY p.id HAVING COALESCE(SUM(v.view_count),0)>0 ORDER BY views DESC,p.sort_order,p.id LIMIT 20");
+    let rows = env.d1("DB")?.prepare(&query).all().await?.results::<serde_json::Value>()?;
+    Response::from_json(&serde_json::json!({"range":range,"items":rows}))
 }
 
 async fn admin_product(path: &str, req: &Request, env: &Env) -> Result<Response> {
