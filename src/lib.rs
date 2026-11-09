@@ -15,8 +15,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     let cache_key = public_cache_key(&req, &path, origin.as_deref(), &env)?;
     if let Some(key) = cache_key.as_deref() {
-        if let Ok(Some(response)) = Cache::default().get(key, false).await {
-            return Ok(response);
+        if let Ok(Some(mut response)) = Cache::default().get(key, false).await {
+            return cors(response.cloned()?, origin.as_deref(), &env);
         }
     }
     let mut response = match (method.clone(), path.as_str()) {
@@ -1106,11 +1106,11 @@ async fn categories(env: &Env) -> Result<Response> {
 
 fn cors(mut response: Response, origin: Option<&str>, env: &Env) -> Result<Response> {
     let allowed = env.var("ALLOWED_ORIGINS")?.to_string();
+    response.headers_mut().set("Vary", "Origin")?;
     if let Some(origin) = origin.filter(|origin| allowed.split(',').any(|item| item == *origin)) {
         response
             .headers_mut()
             .set("Access-Control-Allow-Origin", origin)?;
-        response.headers_mut().set("Vary", "Origin")?;
         response.headers_mut().set(
             "Access-Control-Allow-Headers",
             "Authorization, Content-Type",
