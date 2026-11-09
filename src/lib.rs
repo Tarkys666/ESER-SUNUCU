@@ -25,6 +25,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, "/api/categories") => categories(&env).await,
         (Method::Get, "/api/products") => products(&req, &env).await,
         (Method::Get, "/api/slides") => slides(&env).await,
+        (Method::Get, "/api/legal-profile") => public_legal_profile(&env).await,
         (Method::Post, "/api/admin/login") => login(req, &env).await,
         (Method::Get, "/api/admin/me") => admin_me(&req, &env).await,
         (Method::Post, "/api/admin/logout") => Response::from_json(&serde_json::json!({"ok":true})),
@@ -528,11 +529,31 @@ async fn admin_legal_profile(req: &Request, env: &Env) -> Result<Response> {
     if !authorized(req, env).await? {
         return unauthorized();
     }
-    let profile = env.d1("DB")?.prepare("SELECT legal_name,business_address,privacy_email,privacy_phone,updated_at FROM legal_profile WHERE id=1")
+    let profile = env.d1("DB")?.prepare("SELECT legal_name,business_address,privacy_email,privacy_phone,privacy_legal_basis,privacy_retention,privacy_transfer_details,policy_published,updated_at FROM legal_profile WHERE id=1")
         .first::<serde_json::Value>(None).await?;
     Response::from_json(&profile.unwrap_or_else(|| serde_json::json!({
-        "legal_name":"", "business_address":"", "privacy_email":"", "privacy_phone":"", "updated_at":null
+        "legal_name":"", "business_address":"", "privacy_email":"", "privacy_phone":"",
+        "privacy_legal_basis":"", "privacy_retention":"", "privacy_transfer_details":"",
+        "policy_published":0, "updated_at":null
     })))
+}
+
+async fn public_legal_profile(env: &Env) -> Result<Response> {
+    let profile = env.d1("DB")?.prepare("SELECT legal_name,business_address,privacy_email,privacy_phone,privacy_legal_basis,privacy_retention,privacy_transfer_details,policy_published FROM legal_profile WHERE id=1")
+        .first::<serde_json::Value>(None).await?;
+    let Some(profile) = profile.filter(|row| {
+        row["policy_published"].as_i64() == Some(1)
+            && ["legal_name", "business_address", "privacy_email", "privacy_legal_basis", "privacy_retention", "privacy_transfer_details"]
+                .iter().all(|key| row[*key].as_str().is_some_and(|value| !value.trim().is_empty()))
+    }) else {
+        return Response::from_json(&serde_json::json!({"published":false}));
+    };
+    let mut profile = profile;
+    if let Some(fields) = profile.as_object_mut() {
+        fields.insert("published".into(), serde_json::Value::Bool(true));
+        fields.remove("policy_published");
+    }
+    Response::from_json(&profile)
 }
 
 async fn save_legal_profile(mut req: Request, env: &Env) -> Result<Response> {
@@ -544,9 +565,19 @@ async fn save_legal_profile(mut req: Request, env: &Env) -> Result<Response> {
     let address = body["business_address"].as_str().unwrap_or("").trim();
     let email = body["privacy_email"].as_str().unwrap_or("").trim();
     let phone = body["privacy_phone"].as_str().unwrap_or("").trim();
+    let legal_basis = body["privacy_legal_basis"].as_str().unwrap_or("").trim();
+    let retention = body["privacy_retention"].as_str().unwrap_or("").trim();
+    let transfer_details = body["privacy_transfer_details"].as_str().unwrap_or("").trim();
+    let publish = body["policy_published"].as_bool().unwrap_or(false);
     let valid_email = email.split_once('@').is_some_and(|(local, domain)| {
         !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
     }) && !email.chars().any(char::is_whitespace);
+    if publish && (legal_basis.is_empty() || retention.is_empty() || transfer_details.is_empty()) {
+        return Response::error(
+            r#"{"error":{"code":"POLICY_REVIEW_REQUIRED","message":"Yayına almadan önce hukuki sebep, saklama süresi ve aktarım bilgilerini doğrulayın"}}"#,
+            400,
+        );
+    }
     if legal_name.is_empty()
         || address.is_empty()
         || email.is_empty()
@@ -554,6 +585,9 @@ async fn save_legal_profile(mut req: Request, env: &Env) -> Result<Response> {
         || address.chars().count() > 1000
         || email.chars().count() > 254
         || phone.chars().count() > 40
+        || legal_basis.chars().count() > 4000
+        || retention.chars().count() > 2000
+        || transfer_details.chars().count() > 4000
         || !valid_email
     {
         return Response::error(
@@ -561,8 +595,8 @@ async fn save_legal_profile(mut req: Request, env: &Env) -> Result<Response> {
             400,
         );
     }
-    let profile = env.d1("DB")?.prepare("INSERT INTO legal_profile(id,legal_name,business_address,privacy_email,privacy_phone,updated_at) VALUES(1,?1,?2,?3,?4,datetime('now')) ON CONFLICT(id) DO UPDATE SET legal_name=excluded.legal_name,business_address=excluded.business_address,privacy_email=excluded.privacy_email,privacy_phone=excluded.privacy_phone,updated_at=excluded.updated_at RETURNING legal_name,business_address,privacy_email,privacy_phone,updated_at")
-        .bind(&[legal_name.into(), address.into(), email.into(), phone.into()])?
+    let profile = env.d1("DB")?.prepare("INSERT INTO legal_profile(id,legal_name,business_address,privacy_email,privacy_phone,privacy_legal_basis,privacy_retention,privacy_transfer_details,policy_published,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,datetime('now')) ON CONFLICT(id) DO UPDATE SET legal_name=excluded.legal_name,business_address=excluded.business_address,privacy_email=excluded.privacy_email,privacy_phone=excluded.privacy_phone,privacy_legal_basis=excluded.privacy_legal_basis,privacy_retention=excluded.privacy_retention,privacy_transfer_details=excluded.privacy_transfer_details,policy_published=excluded.policy_published,updated_at=excluded.updated_at RETURNING legal_name,business_address,privacy_email,privacy_phone,privacy_legal_basis,privacy_retention,privacy_transfer_details,policy_published,updated_at")
+        .bind(&[legal_name.into(), address.into(), email.into(), phone.into(), legal_basis.into(), retention.into(), transfer_details.into(), (if publish {1_i32} else {0_i32}).into()])?
         .first::<serde_json::Value>(None).await?;
     Response::from_json(&profile.unwrap_or_else(|| serde_json::json!({"saved":true})))
 }
