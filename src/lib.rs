@@ -31,6 +31,8 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, "/api/admin/categories") => admin_categories(&req, &env).await,
         (Method::Get, "/api/admin/products") => admin_products(&req, &env).await,
         (Method::Get, "/api/admin/analytics/products") => admin_product_analytics(&req, &env).await,
+        (Method::Get, "/api/admin/legal-profile") => admin_legal_profile(&req, &env).await,
+        (Method::Put, "/api/admin/legal-profile") => save_legal_profile(req, &env).await,
         (Method::Post, "/api/admin/products") => save_product(req, &env).await,
         (Method::Get, "/api/admin/slides") => admin_slides(&req, &env).await,
         (Method::Post, "/api/admin/slides") => save_slide(req, &env).await,
@@ -520,6 +522,49 @@ async fn admin_product_analytics(req: &Request, env: &Env) -> Result<Response> {
     let query = format!("SELECT p.id,p.title,COALESCE(SUM(v.view_count),0) AS views FROM products p LEFT JOIN product_view_daily v ON v.product_id=p.id {date_filter} WHERE p.status='published' GROUP BY p.id HAVING COALESCE(SUM(v.view_count),0)>0 ORDER BY views DESC,p.sort_order,p.id LIMIT 20");
     let rows = env.d1("DB")?.prepare(&query).all().await?.results::<serde_json::Value>()?;
     Response::from_json(&serde_json::json!({"range":range,"items":rows}))
+}
+
+async fn admin_legal_profile(req: &Request, env: &Env) -> Result<Response> {
+    if !authorized(req, env).await? {
+        return unauthorized();
+    }
+    let profile = env.d1("DB")?.prepare("SELECT legal_name,business_address,privacy_email,privacy_phone,updated_at FROM legal_profile WHERE id=1")
+        .first::<serde_json::Value>(None).await?;
+    Response::from_json(&profile.unwrap_or_else(|| serde_json::json!({
+        "legal_name":"", "business_address":"", "privacy_email":"", "privacy_phone":"", "updated_at":null
+    })))
+}
+
+async fn save_legal_profile(mut req: Request, env: &Env) -> Result<Response> {
+    if !authorized(&req, env).await? {
+        return unauthorized();
+    }
+    let body: serde_json::Value = req.json().await?;
+    let legal_name = body["legal_name"].as_str().unwrap_or("").trim();
+    let address = body["business_address"].as_str().unwrap_or("").trim();
+    let email = body["privacy_email"].as_str().unwrap_or("").trim();
+    let phone = body["privacy_phone"].as_str().unwrap_or("").trim();
+    let valid_email = email.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+    }) && !email.chars().any(char::is_whitespace);
+    if legal_name.is_empty()
+        || address.is_empty()
+        || email.is_empty()
+        || legal_name.chars().count() > 250
+        || address.chars().count() > 1000
+        || email.chars().count() > 254
+        || phone.chars().count() > 40
+        || !valid_email
+    {
+        return Response::error(
+            r#"{"error":{"code":"INVALID_INPUT","message":"Firma bilgilerini kontrol edin"}}"#,
+            400,
+        );
+    }
+    let profile = env.d1("DB")?.prepare("INSERT INTO legal_profile(id,legal_name,business_address,privacy_email,privacy_phone,updated_at) VALUES(1,?1,?2,?3,?4,datetime('now')) ON CONFLICT(id) DO UPDATE SET legal_name=excluded.legal_name,business_address=excluded.business_address,privacy_email=excluded.privacy_email,privacy_phone=excluded.privacy_phone,updated_at=excluded.updated_at RETURNING legal_name,business_address,privacy_email,privacy_phone,updated_at")
+        .bind(&[legal_name.into(), address.into(), email.into(), phone.into()])?
+        .first::<serde_json::Value>(None).await?;
+    Response::from_json(&profile.unwrap_or_else(|| serde_json::json!({"saved":true})))
 }
 
 async fn admin_product(path: &str, req: &Request, env: &Env) -> Result<Response> {
