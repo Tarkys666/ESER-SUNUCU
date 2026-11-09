@@ -561,7 +561,7 @@ async fn save_category(mut req: Request, env: &Env) -> Result<Response> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         || !(1..=150).contains(&name.chars().count())
-        || !(0..=1_000_000).contains(&order)
+        || !(1..=1_000_000).contains(&order)
         || id == "all"
     {
         return Response::error(
@@ -574,6 +574,7 @@ async fn save_category(mut req: Request, env: &Env) -> Result<Response> {
         .bind(&[id.into(), name.into(), (order as i32).into()])?
         .run()
         .await?;
+    let order = set_category_order(id, order, env).await?.unwrap_or(order);
     Response::from_json(&serde_json::json!({"id":id,"name":name,"sort_order":order,"version":1}))
 }
 
@@ -598,6 +599,15 @@ async fn update_category(path: &str, mut req: Request, env: &Env) -> Result<Resp
         db.prepare("UPDATE categories SET cover_path=NULLIF(?2,'') WHERE id=?1")
             .bind(&[id.into(),key.into()])?.run().await?;
         return Response::from_json(&serde_json::json!({"id":id,"cover_path":cover}));
+    }
+    if let Some(value) = body.get("sort_order") {
+        let Some(order) = value.as_i64().filter(|order| (1..=1_000_000).contains(order)) else {
+            return Response::error("Invalid catalog order", 400);
+        };
+        let Some(order) = set_category_order(id, order, env).await? else {
+            return Response::error("Category not found", 404);
+        };
+        return Response::from_json(&serde_json::json!({"id":id,"sort_order":order}));
     }
     let product_id = body["featured_product_id"].as_str().unwrap_or("");
     if !product_id.is_empty() {
@@ -636,6 +646,29 @@ async fn update_category(path: &str, mut req: Request, env: &Env) -> Result<Resp
     Response::from_json(
         &serde_json::json!({"id":id,"featured_product_id":if product_id.is_empty(){serde_json::Value::Null}else{serde_json::json!(product_id)}}),
     )
+}
+
+async fn set_category_order(id: &str, order: i64, env: &Env) -> Result<Option<i64>> {
+    let db = env.d1("DB")?;
+    let rows = db.prepare("SELECT id FROM categories ORDER BY sort_order,id")
+        .all().await?.results::<serde_json::Value>()?;
+    let mut ids: Vec<String> = rows.into_iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect();
+    let Some(current) = ids.iter().position(|category_id| category_id == id) else {
+        return Ok(None);
+    };
+    ids.remove(current);
+    let target = order.saturating_sub(1) as usize;
+    let target = target.min(ids.len());
+    ids.insert(target, id.to_owned());
+    let mut statements = Vec::with_capacity(ids.len());
+    for (index, category_id) in ids.iter().enumerate() {
+        statements.push(db.prepare("UPDATE categories SET sort_order=?1 WHERE id=?2")
+            .bind(&[((index + 1) as i32).into(), category_id.as_str().into()])?);
+    }
+    let _ = db.batch(statements).await?;
+    Ok(Some((target + 1) as i64))
 }
 
 async fn delete_category(path: &str, req: &Request, env: &Env) -> Result<Response> {
