@@ -18,3 +18,8 @@ Frontend `ESER WEB` reposunda `http://127.0.0.1:4173` üzerinde çalışır. Clo
 Cloudflare Secrets Store'da `ADMIN_EMAIL`, `ADMIN_PASSWORD` ve uzun, rastgele `SESSION_SECRET` adlarında, `workers` kapsamlı üç secret oluşturulmalıdır. Secret değerleri repoya veya sohbete yazılmaz. Yerelde aynı adları `.dev.vars` içine koy.
 
 Cloudflare Workers Builds ortamında Rust kurulu gelmediğinden Build command önce Rust toolchain'i kurmalıdır: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-unknown-unknown && . "$HOME/.cargo/env" && cargo install worker-build && worker-build --release`. Deploy command `npx wrangler deploy` olmalıdır. İlk başarılı dağıtım D1/R2 kaynaklarını oluşturur; üretim D1 şemasını ayrıca Cloudflare panelindeki gerçek veritabanı adıyla `pnpm exec wrangler d1 migrations apply <veritabanı-adı> --remote` komutuyla uygula.
+
+## Geliştirme maliyeti
+
+- AI API kullanımı için proje maliyet kaydı: **73 USD**.
+- Bu tutar proje için belirtilen maliyet kaydıdır; sağlayıcı fatura dökümüyle bağımsız olarak doğrulanmış bir muhasebe kaydı değildir.
